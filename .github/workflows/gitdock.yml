@@ -1,0 +1,86 @@
+name: Pull Docker Image from Commit
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+
+jobs:
+  docker-pull:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read commit message
+        id: msg
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "message=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Extract Docker image name
+        id: extract
+        run: |
+          MSG="${{ steps.msg.outputs.message }}"
+          if [[ "$MSG" =~ ^docker:[[:space:]]*(.+)$ ]]; then
+            IMAGE="${BASH_REMATCH[1]}"
+            echo "image=$IMAGE" >> $GITHUB_OUTPUT
+            echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+            echo "Found Docker image: $IMAGE"
+          else
+            echo "ℹ️ No 'docker:' command – exiting gracefully"
+            exit 0
+          fi
+
+      - name: Pull Docker image
+        if: env.IMAGE != ''
+        run: |
+          echo "🐳 Pulling $IMAGE"
+          docker pull "$IMAGE"
+
+      - name: Save image as tar file
+        if: env.IMAGE != ''
+        run: |
+          SAFENAME=$(echo "$IMAGE" | tr '/:' '_')
+          mkdir -p docker-images tmp_docker
+          TAR_PATH="tmp_docker/${SAFENAME}.tar"
+          docker save "$IMAGE" -o "$TAR_PATH"
+          echo "TAR_PATH=$TAR_PATH" >> $GITHUB_ENV
+          echo "SAFENAME=$SAFENAME" >> $GITHUB_ENV
+
+      - name: Split tar into 50MB chunks (if needed)
+        if: env.IMAGE != ''
+        run: |
+          SIZE=$(stat -c%s "${{ env.TAR_PATH }}")
+          LIMIT=$((50 * 1024 * 1024))   # 50 MB
+          BASENAME="${{ env.SAFENAME }}.tar"
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting into 50MB chunks..."
+            CHUNK_DIR="docker-images/${BASENAME}.parts"
+            mkdir -p "$CHUNK_DIR"
+            split -b 50M "${{ env.TAR_PATH }}" "${CHUNK_DIR}/${BASENAME}.part"
+            echo "✅ Created $(ls ${CHUNK_DIR} | wc -l) chunks"
+          else
+            cp "${{ env.TAR_PATH }}" "docker-images/$BASENAME"
+            echo "✅ Copied directly (size under 50MB)"
+          fi
+
+      - name: Clean up temp files
+        if: env.IMAGE != ''
+        run: rm -rf tmp_docker
+
+      - name: Commit and push chunks/image
+        if: env.IMAGE != ''
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add docker-images/
+          git commit -m "Add Docker image: ${{ env.IMAGE }} [skip ci]" || echo "Nothing to commit"
+          git push origin HEAD:$BRANCH
